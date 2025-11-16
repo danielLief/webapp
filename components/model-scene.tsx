@@ -9,22 +9,70 @@ interface ControlsApi {
   reset: () => void;
 }
 
+type AssetMap = Record<string, string>;
+
 interface ModelSceneProps {
   modelUrl: string | null;
   modelExtension: string | null;
+  modelName: string;
+  assetMap?: AssetMap;
+  onRotateRequest?: (axis: "x" | "y" | "z") => void;
   cameraRef?: MutableRefObject<THREE.PerspectiveCamera | null>;
   onControlsReady?: (api: ControlsApi | null) => void;
   onLoadingChange?: (loading: boolean) => void;
 }
 
 const PITCH_LIMIT = Math.PI / 2 - 0.05;
-const MOVE_SPEED = 6;
+const MOVE_SPEED = 4;
+const ACCELERATION = 14;
+const DECELERATION = 10;
 const LOOK_SENSITIVITY = 0.003;
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
+const ROTATION_DEGREES = 90;
+const ROTATION_RADIANS = THREE.MathUtils.degToRad(ROTATION_DEGREES);
+
+const normalizeAssetKey = (value: string) => {
+  const cleaned = value
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .split(/[?#]/)[0]
+    .toLowerCase()
+    .replace(/\\/g, "/");
+  const parts = cleaned.split("/");
+  return parts[parts.length - 1] || cleaned;
+};
+
+const resolveAssetUrl = (assetMap: AssetMap | undefined, name?: string | null) => {
+  if (!assetMap || !name) return null;
+  return assetMap[normalizeAssetKey(name)] ?? null;
+};
+
+const findMtlUrl = (assetMap: AssetMap | undefined, modelName: string) => {
+  if (!assetMap) return null;
+  const base = modelName.toLowerCase().replace(/\.[^/.]+$/, "");
+  const preferred = resolveAssetUrl(assetMap, `${base}.mtl`);
+  if (preferred) return preferred;
+  const entry = Object.entries(assetMap).find(([key]) => key.endsWith(".mtl"));
+  return entry ? entry[1] : null;
+};
+
+const createLoadingManager = (assetMap: AssetMap | undefined) => {
+  if (!assetMap || Object.keys(assetMap).length === 0) return undefined;
+  const manager = new THREE.LoadingManager();
+  manager.setURLModifier((url) => {
+    if (url.startsWith("blob:")) return url;
+    const resolved = resolveAssetUrl(assetMap, url);
+    return resolved ?? url;
+  });
+  return manager;
+};
 
 export function ModelScene({
   modelUrl,
   modelExtension,
+  modelName,
+  assetMap,
+  onRotateRequest,
   cameraRef,
   onControlsReady,
   onLoadingChange,
@@ -34,6 +82,9 @@ export function ModelScene({
   const modelRef = useRef<THREE.Object3D | null>(null);
   const yawRef = useRef(0);
   const pitchRef = useRef(0);
+  const rotationRef = useRef({ x: 0, y: 0, z: 0 });
+  const velocityRef = useRef(new THREE.Vector3(0, 0, 0));
+  const verticalVelocityRef = useRef(0);
   const movementRef = useRef({
     forward: false,
     backward: false,
@@ -72,6 +123,32 @@ export function ModelScene({
     });
   };
 
+const alignInitialModel = (object: THREE.Object3D) => {
+  const box = new THREE.Box3().setFromObject(object);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  object.position.sub(center);
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const scale = 8 / maxDim;
+  object.scale.setScalar(scale);
+  const adjustedBox = new THREE.Box3().setFromObject(object);
+  const adjustedCenter = adjustedBox.getCenter(new THREE.Vector3());
+  object.position.x -= adjustedCenter.x;
+  object.position.z -= adjustedCenter.z;
+  object.position.y -= adjustedBox.min.y;
+};
+
+const recenterModel = (object: THREE.Object3D) => {
+  const box = new THREE.Box3().setFromObject(object);
+  const center = box.getCenter(new THREE.Vector3());
+  object.position.sub(center);
+  const adjustedBox = new THREE.Box3().setFromObject(object);
+  const adjustedCenter = adjustedBox.getCenter(new THREE.Vector3());
+  object.position.x -= adjustedCenter.x;
+  object.position.z -= adjustedCenter.z;
+  object.position.y -= adjustedBox.min.y;
+};
+
   const removeCurrentModel = () => {
     if (!modelRef.current) return;
     disposeObject(modelRef.current);
@@ -93,6 +170,12 @@ export function ModelScene({
       up: false,
       down: false,
     };
+    velocityRef.current.set(0, 0, 0);
+    verticalVelocityRef.current = 0;
+    rotationRef.current = { x: 0, y: 0, z: 0 };
+    if (modelRef.current) {
+      modelRef.current.rotation.set(0, 0, 0);
+    }
   };
 
   useEffect(() => {
@@ -102,6 +185,19 @@ export function ModelScene({
   useEffect(() => {
     onControlsReady?.({
       reset: () => resetCamera(),
+      rotate: (axis) => {
+        if (!modelRef.current) return;
+        const rotationAxis =
+          axis === "x"
+            ? new THREE.Vector3(1, 0, 0)
+            : axis === "y"
+            ? new THREE.Vector3(0, 1, 0)
+            : new THREE.Vector3(0, 0, 1);
+        modelRef.current.rotateOnAxis(rotationAxis, ROTATION_RADIANS);
+        rotationRef.current[axis] =
+          (rotationRef.current[axis] + ROTATION_RADIANS) % (Math.PI * 2);
+        recenterModel(modelRef.current);
+      },
     });
     return () => {
       onControlsReady?.(null);
@@ -307,9 +403,34 @@ export function ModelScene({
           const { OBJLoader } = await import(
             "three/examples/jsm/loaders/OBJLoader"
           );
+          const manager = createLoadingManager(assetMap);
+          const objLoader = manager ? new OBJLoader(manager) : new OBJLoader();
+          const mtlUrl = findMtlUrl(assetMap, modelName);
+          if (mtlUrl) {
+            const { MTLLoader } = await import(
+              "three/examples/jsm/loaders/MTLLoader"
+            );
+            const mtlLoader = manager ? new MTLLoader(manager) : new MTLLoader();
+            const materials = await mtlLoader.loadAsync(mtlUrl);
+            if (materials.setTexturePath) {
+              materials.setTexturePath("");
+            }
+            const originalLoadTexture = materials.loadTexture.bind(materials);
+            materials.loadTexture = (textureUrl, mapping, onLoad, onError) => {
+              const resolved = resolveAssetUrl(assetMap, textureUrl) ?? textureUrl;
+              const loader = new THREE.TextureLoader(manager ?? undefined);
+              const texture = loader.load(resolved, onLoad, undefined, onError);
+              if (mapping && texture) {
+                texture.mapping = mapping;
+              }
+              return texture;
+            };
+            materials.preload();
+            objLoader.setMaterials(materials);
+          }
+
           const response = await fetch(modelUrl);
           const text = await response.text();
-          const objLoader = new OBJLoader();
           object = objLoader.parse(text);
         } else if (modelExtension === "fbx") {
           const { FBXLoader } = await import(
@@ -327,22 +448,7 @@ export function ModelScene({
             return;
           }
 
-          const box = new THREE.Box3().setFromObject(object);
-          const center = box.getCenter(new THREE.Vector3());
-          const size = box.getSize(new THREE.Vector3());
-
-          object.position.sub(center);
-
-          const maxDim = Math.max(size.x, size.y, size.z) || 1;
-          const scale = 8 / maxDim;
-          object.scale.multiplyScalar(scale);
-
-          const adjustedBox = new THREE.Box3().setFromObject(object);
-          const adjustedCenter = adjustedBox.getCenter(new THREE.Vector3());
-          object.position.x -= adjustedCenter.x;
-          object.position.z -= adjustedCenter.z;
-          const minY = adjustedBox.min.y;
-          object.position.y -= minY;
+          alignInitialModel(object);
 
           removeCurrentModel();
           modelRef.current = object;
@@ -362,7 +468,7 @@ export function ModelScene({
       cancelled = true;
       onLoadingChange?.(false);
     };
-  }, [modelUrl, modelExtension, onLoadingChange]);
+  }, [modelUrl, modelExtension, assetMap, modelName, onLoadingChange]);
 
   useFrame((_, delta) => {
     rotationEuler.current.set(pitchRef.current, yawRef.current, 0, "YXZ");
@@ -377,19 +483,27 @@ export function ModelScene({
     if (movement.right) direction.x += 1;
     const vertical = (movement.up ? 1 : 0) - (movement.down ? 1 : 0);
 
-    if (direction.lengthSq() > 0) {
-      direction.normalize();
-      const moveVector = moveVectorRef.current;
-      moveVector.set(direction.x, 0, direction.z);
-      yawQuaternion.current.setFromAxisAngle(WORLD_UP, yawRef.current);
-      moveVector.applyQuaternion(yawQuaternion.current);
-      moveVector.multiplyScalar(MOVE_SPEED * delta);
-      camera.position.add(moveVector);
-    }
+    direction.normalize();
 
-    if (vertical !== 0) {
-      camera.position.y += vertical * MOVE_SPEED * delta;
-    }
+    const moveVector = moveVectorRef.current;
+    moveVector.set(direction.x, 0, direction.z);
+    yawQuaternion.current.setFromAxisAngle(WORLD_UP, yawRef.current);
+    moveVector.applyQuaternion(yawQuaternion.current);
+
+    const targetVelocity = moveVector.multiplyScalar(MOVE_SPEED);
+    velocityRef.current.lerp(targetVelocity, Math.min(ACCELERATION * delta, 1));
+    camera.position.addScaledVector(velocityRef.current, delta);
+
+    const targetVertical = vertical * MOVE_SPEED;
+    verticalVelocityRef.current = THREE.MathUtils.lerp(
+      verticalVelocityRef.current,
+      targetVertical,
+      Math.min(
+        (vertical !== 0 ? ACCELERATION : DECELERATION) * delta,
+        1
+      )
+    );
+    camera.position.y += verticalVelocityRef.current * delta;
   });
 
   return <>{model ? <primitive object={model} /> : null}</>;

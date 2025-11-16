@@ -1,7 +1,7 @@
 'use client'
 
 import { Canvas } from "@react-three/fiber";
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import type { PerspectiveCamera } from "three";
 import { ModelScene } from "./model-scene";
 import { ViewerControls } from "./viewer-controls";
@@ -11,33 +11,79 @@ interface ControlsApi {
   reset: () => void;
 }
 
+type AssetMap = Record<string, string>;
+
+const SUPPORTED_MODEL_EXTENSIONS = ["glb", "gltf", "fbx", "obj"];
+
+const normalizeName = (name: string) => {
+  const cleaned = name.trim().replace(/^["']|["']$/g, "").split(/[?#]/)[0];
+  const normalized = cleaned.toLowerCase().replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || normalized;
+};
+
 export function ModelViewer() {
   const [modelUrl, setModelUrl] = useState<string | null>(null);
   const [modelName, setModelName] = useState<string>("");
   const [modelExtension, setModelExtension] = useState<string | null>(null);
+  const [assetMap, setAssetMap] = useState<AssetMap>({});
   const [isLoading, setIsLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<PerspectiveCamera | null>(null);
   const controlsApiRef = useRef<ControlsApi | null>(null);
+  const assetUrlsRef = useRef<string[]>([]);
+
+  const cleanupAssets = () => {
+    assetUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    assetUrlsRef.current = [];
+    setAssetMap({});
+  };
+
+  useEffect(() => {
+    return () => {
+      cleanupAssets();
+    };
+  }, []);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) {
-      if (modelUrl) {
-        URL.revokeObjectURL(modelUrl);
-      }
-      const url = URL.createObjectURL(file);
-      setModelUrl(url);
-      setModelName(file.name);
-      const ext = file.name.split(".").pop()?.toLowerCase() ?? null;
-      setModelExtension(ext);
+    const selectedFiles = Array.from(event.target.files ?? []);
+    if (selectedFiles.length === 0) {
+      return;
     }
+
+    cleanupAssets();
+
+    const nextAssetMap: AssetMap = {};
+    let primaryFile: File | null = null;
+
+    for (const file of selectedFiles) {
+      const url = URL.createObjectURL(file);
+      assetUrlsRef.current.push(url);
+      nextAssetMap[normalizeName(file.name)] = url;
+
+      const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+      if (ext === "obj") {
+        primaryFile = file;
+      } else if (!primaryFile && SUPPORTED_MODEL_EXTENSIONS.includes(ext)) {
+        primaryFile = file;
+      }
+    }
+
+    if (!primaryFile) {
+      primaryFile = selectedFiles[0];
+    }
+
+    const primaryExt = primaryFile.name.split(".").pop()?.toLowerCase() ?? null;
+    const primaryUrl = nextAssetMap[normalizeName(primaryFile.name)];
+
+    setAssetMap(nextAssetMap);
+    setModelUrl(primaryUrl ?? null);
+    setModelName(primaryFile.name);
+    setModelExtension(primaryExt);
   };
 
   const handleClear = () => {
-    if (modelUrl) {
-      URL.revokeObjectURL(modelUrl);
-    }
+    cleanupAssets();
     setModelUrl(null);
     setModelName("");
     setModelExtension(null);
@@ -49,6 +95,10 @@ export function ModelViewer() {
 
   const handleResetCamera = () => {
     controlsApiRef.current?.reset();
+  };
+
+  const handleRotate = (axis: "x" | "y" | "z") => {
+    controlsApiRef.current?.rotate?.(axis);
   };
 
   return (
@@ -67,6 +117,11 @@ export function ModelViewer() {
           <ModelScene
             modelUrl={modelUrl}
             modelExtension={modelExtension}
+            modelName={modelName}
+            assetMap={assetMap}
+            onRotateRequest={(axis) => {
+              controlsApiRef.current?.rotate?.(axis);
+            }}
             cameraRef={cameraRef}
             onControlsReady={(api) => {
               controlsApiRef.current = api;
@@ -98,7 +153,7 @@ export function ModelViewer() {
           <h3 className="font-mono text-sm font-semibold text-foreground/100 mb-3 uppercase tracking-wide">
             Model Viewer
           </h3>
-          <p className="font-mono text-xs text-foreground/40 mb-4">
+          <p className="font-mono text-xs text-foreground/40 mb-4 truncate">
             {modelName ? `Loaded: ${modelName}` : "No model loaded"}
           </p>
         </div>
@@ -112,7 +167,8 @@ export function ModelViewer() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".gltf,.glb,.obj,.fbx"
+              accept=".gltf,.glb,.obj,.fbx,.mtl,.png,.jpg,.jpeg,.webp"
+              multiple
               onChange={handleFileUpload}
               className="hidden"
             />
@@ -130,13 +186,14 @@ export function ModelViewer() {
           <ViewerControls
             onClear={handleClear}
             onResetCamera={handleResetCamera}
+            onRotate={handleRotate}
           />
         )}
 
         {/* Info */}
         <div className="space-y-2 pt-2 border-t border-border">
           <p className="font-mono text-xs text-foreground/40 leading-relaxed">
-            Supported formats: GLTF, GLB, OBJ, FBX
+            Supported formats: Raw Mesh (OBJ), Textured Mesh (OBJ + MTL + PNG)
           </p>
           <p className="font-mono text-xs text-foreground/40 leading-relaxed">
             Controls: WASD to move • Space to rise • Shift to descend • Hold left-click and drag to look around
