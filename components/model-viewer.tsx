@@ -9,11 +9,30 @@ import { Upload } from "lucide-react";
 
 interface ControlsApi {
   reset: () => void;
+  rotate?: (axis: "x" | "y" | "z") => void;
 }
 
 type AssetMap = Record<string, string>;
+type PointCloudData =
+  | {
+      kind: "bin";
+      url: string;
+      hasHeaderCount: boolean;
+    }
+  | {
+      kind: "las";
+      url: string;
+    };
 
-const SUPPORTED_MODEL_EXTENSIONS = ["glb", "gltf", "fbx", "obj"];
+type PoseData = {
+  url: string;
+};
+
+type PoseLocationsData = {
+  url: string;
+};
+
+const SUPPORTED_MODEL_EXTENSIONS = ["glb", "gltf", "fbx", "obj", "bin", "las", "pf", "plf"];
 
 const normalizeName = (name: string) => {
   const cleaned = name.trim().replace(/^["']|["']$/g, "").split(/[?#]/)[0];
@@ -27,6 +46,10 @@ export function ModelViewer() {
   const [modelName, setModelName] = useState<string>("");
   const [modelExtension, setModelExtension] = useState<string | null>(null);
   const [assetMap, setAssetMap] = useState<AssetMap>({});
+  const [pointCloud, setPointCloud] = useState<PointCloudData | null>(null);
+  const [poseData, setPoseData] = useState<PoseData | null>(null);
+  const [poseLocations, setPoseLocations] = useState<PoseLocationsData | null>(null);
+  const [scale, setScale] = useState(1);
   const [isLoading, setIsLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<PerspectiveCamera | null>(null);
@@ -37,6 +60,10 @@ export function ModelViewer() {
     assetUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     assetUrlsRef.current = [];
     setAssetMap({});
+    setPointCloud(null);
+    setPoseData(null);
+    setPoseLocations(null);
+    setScale(1);
   };
 
   useEffect(() => {
@@ -80,6 +107,40 @@ export function ModelViewer() {
     setModelUrl(primaryUrl ?? null);
     setModelName(primaryFile.name);
     setModelExtension(primaryExt);
+    setScale(1);
+    if (primaryExt === "bin" && primaryUrl) {
+      const size = primaryFile.size;
+      setPointCloud({
+        kind: "bin",
+        url: primaryUrl,
+        hasHeaderCount: size >= 4,
+      });
+      setPoseData(null);
+      setPoseLocations(null);
+    } else if (primaryExt === "las" && primaryUrl) {
+      setPointCloud({
+        kind: "las",
+        url: primaryUrl,
+      });
+      setPoseData(null);
+      setPoseLocations(null);
+    } else if (primaryExt === "pf" && primaryUrl) {
+      setPointCloud(null);
+      setPoseLocations(null);
+      setPoseData({
+        url: primaryUrl,
+      });
+    } else if (primaryExt === "plf" && primaryUrl) {
+      setPointCloud(null);
+      setPoseData(null);
+      setPoseLocations({
+        url: primaryUrl,
+      });
+    } else {
+      setPointCloud(null);
+      setPoseData(null);
+      setPoseLocations(null);
+    }
   };
 
   const handleClear = () => {
@@ -87,6 +148,7 @@ export function ModelViewer() {
     setModelUrl(null);
     setModelName("");
     setModelExtension(null);
+    setScale(1);
     controlsApiRef.current?.reset();
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -119,6 +181,10 @@ export function ModelViewer() {
             modelExtension={modelExtension}
             modelName={modelName}
             assetMap={assetMap}
+            pointCloud={pointCloud}
+            poseData={poseData}
+            poseLocations={poseLocations}
+            scaleMultiplier={scale}
             onRotateRequest={(axis) => {
               controlsApiRef.current?.rotate?.(axis);
             }}
@@ -167,7 +233,7 @@ export function ModelViewer() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".gltf,.glb,.obj,.fbx,.mtl,.png,.jpg,.jpeg,.webp"
+              accept=".gltf,.glb,.obj,.fbx,.mtl,.png,.jpg,.jpeg,.webp,.bin,.las,.pf,.plf"
               multiple
               onChange={handleFileUpload}
               className="hidden"
@@ -187,13 +253,15 @@ export function ModelViewer() {
             onClear={handleClear}
             onResetCamera={handleResetCamera}
             onRotate={handleRotate}
+            scale={scale}
+            onScaleChange={setScale}
           />
         )}
 
         {/* Info */}
         <div className="space-y-2 pt-2 border-t border-border">
           <p className="font-mono text-xs text-foreground/40 leading-relaxed">
-            Supported formats: Raw Mesh (OBJ), Textured Mesh (OBJ + MTL + PNG)
+            Supported formats: Raw Mesh (OBJ), Textured Mesh (OBJ + MTL + PNG), Point Cloud (BIN, LAS), Pose File (PF), Pose Locations (PLF)
           </p>
           <p className="font-mono text-xs text-foreground/40 leading-relaxed">
             Controls: WASD to move • Space to rise • Shift to descend • Hold left-click and drag to look around

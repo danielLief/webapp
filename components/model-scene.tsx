@@ -16,10 +16,28 @@ interface ModelSceneProps {
   modelExtension: string | null;
   modelName: string;
   assetMap?: AssetMap;
+  pointCloud?:
+    | {
+        kind: "bin";
+        url: string;
+        hasHeaderCount: boolean;
+      }
+    | {
+        kind: "las";
+        url: string;
+      }
+    | null;
+  poseData?: {
+    url: string;
+  } | null;
+  poseLocations?: {
+    url: string;
+  } | null;
   onRotateRequest?: (axis: "x" | "y" | "z") => void;
   cameraRef?: MutableRefObject<THREE.PerspectiveCamera | null>;
   onControlsReady?: (api: ControlsApi | null) => void;
   onLoadingChange?: (loading: boolean) => void;
+  scaleMultiplier?: number;
 }
 
 const PITCH_LIMIT = Math.PI / 2 - 0.05;
@@ -30,6 +48,9 @@ const LOOK_SENSITIVITY = 0.003;
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const ROTATION_DEGREES = 90;
 const ROTATION_RADIANS = THREE.MathUtils.degToRad(ROTATION_DEGREES);
+const ZOOM_SPEED = 0.002;
+const MIN_ZOOM_DISTANCE = 0.5;
+const MAX_ZOOM_DISTANCE = 800;
 
 const normalizeAssetKey = (value: string) => {
   const cleaned = value
@@ -67,15 +88,357 @@ const createLoadingManager = (assetMap: AssetMap | undefined) => {
   return manager;
 };
 
+const MAX_POINTS = 5000000;
+const MAX_POSES = 3000;
+const MAX_POSE_LOC_POINTS = 250000;
+const MAX_POINT_MAGNITUDE = 1e7;
+
+interface ParsedPointCloud {
+  positions: Float32Array;
+  colors?: Float32Array;
+  metadata: {
+    headerOffset: number;
+    declaredCount: number | null;
+    recordCount: number;
+    downsampleStep: number;
+    probeFloatHits: number;
+    probeIntHits: number;
+    usedIntegerMode: boolean;
+    acceptedPoints: number;
+  };
+}
+
+const parsePointCloud = (
+  buffer: ArrayBuffer,
+  hasHeaderCount: boolean
+): ParsedPointCloud | null => {
+  const view = new DataView(buffer);
+  const stride = 24;
+  const totalBytes = buffer.byteLength;
+
+  let headerOffset = 0;
+  let declaredCount: number | null = null;
+
+  if (hasHeaderCount && totalBytes >= 4) {
+    const candidate = view.getUint32(0, true);
+    const expectedBytes = 4 + candidate * stride;
+    if (
+      candidate > 0 &&
+      expectedBytes <= totalBytes &&
+      Math.abs(expectedBytes - totalBytes) < stride
+    ) {
+      headerOffset = 4;
+      declaredCount = candidate;
+    }
+  }
+
+  const availableBytes = totalBytes - headerOffset;
+  if (availableBytes < stride) return null;
+
+  const maxPossible = Math.floor(availableBytes / stride);
+  if (maxPossible <= 0) return null;
+
+  const recordCount = declaredCount
+    ? Math.min(declaredCount, maxPossible)
+    : maxPossible;
+
+  const step = Math.max(1, Math.floor(recordCount / MAX_POINTS));
+  const sampledCount = Math.max(1, Math.floor(recordCount / step));
+
+  const probeSamples = Math.min(1000, recordCount);
+  const probeStride = Math.max(1, Math.floor(recordCount / probeSamples));
+  let floatValid = 0;
+  let intValid = 0;
+  let probeIterations = 0;
+
+  for (let i = 0; i < recordCount && probeIterations < probeSamples; i += probeStride) {
+    const base = headerOffset + i * stride;
+    const xf = view.getFloat32(base, true);
+    const yf = view.getFloat32(base + 4, true);
+    const zf = view.getFloat32(base + 8, true);
+    const xi = view.getInt32(base, true) / 1000;
+    const yi = view.getInt32(base + 4, true) / 1000;
+    const zi = view.getInt32(base + 8, true) / 1000;
+    probeIterations++;
+
+    const validFloat =
+      Number.isFinite(xf) &&
+      Number.isFinite(yf) &&
+      Number.isFinite(zf) &&
+      Math.abs(xf) <= MAX_POINT_MAGNITUDE &&
+      Math.abs(yf) <= MAX_POINT_MAGNITUDE &&
+      Math.abs(zf) <= MAX_POINT_MAGNITUDE;
+
+    const validInt =
+      Number.isFinite(xi) &&
+      Number.isFinite(yi) &&
+      Number.isFinite(zi) &&
+      Math.abs(xi) <= MAX_POINT_MAGNITUDE &&
+      Math.abs(yi) <= MAX_POINT_MAGNITUDE &&
+      Math.abs(zi) <= MAX_POINT_MAGNITUDE;
+
+    if (validFloat) floatValid++;
+    if (validInt) intValid++;
+  }
+
+  const useInt = intValid > floatValid;
+  const positions = new Float32Array(sampledCount * 3);
+  let writeIndex = 0;
+
+  for (let i = 0; i < recordCount; i += step) {
+    const base = headerOffset + i * stride;
+    const xRaw = useInt ? view.getInt32(base, true) : view.getFloat32(base, true);
+    const yRaw = useInt ? view.getInt32(base + 4, true) : view.getFloat32(base + 4, true);
+    const zRaw = useInt ? view.getInt32(base + 8, true) : view.getFloat32(base + 8, true);
+
+    const x = useInt ? xRaw / 1000 : xRaw;
+    const y = useInt ? yRaw / 1000 : yRaw;
+    const z = useInt ? zRaw / 1000 : zRaw;
+
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(z) ||
+      Math.abs(x) > MAX_POINT_MAGNITUDE ||
+      Math.abs(y) > MAX_POINT_MAGNITUDE ||
+      Math.abs(z) > MAX_POINT_MAGNITUDE
+    ) {
+      continue;
+    }
+
+    positions[writeIndex * 3 + 0] = x;
+    positions[writeIndex * 3 + 1] = y;
+    positions[writeIndex * 3 + 2] = z;
+    writeIndex++;
+    if (writeIndex >= sampledCount) break;
+  }
+
+  if (writeIndex === 0) return null;
+
+  return {
+    positions: writeIndex === sampledCount ? positions : positions.slice(0, writeIndex * 3),
+    metadata: {
+      headerOffset,
+      declaredCount,
+      recordCount,
+      downsampleStep: step,
+      probeFloatHits: floatValid,
+      probeIntHits: intValid,
+      usedIntegerMode: useInt,
+      acceptedPoints: writeIndex,
+    },
+  };
+};
+
+const parseLasPointCloud = (buffer: ArrayBuffer): ParsedPointCloud | null => {
+  if (buffer.byteLength < 227) return null;
+  const view = new DataView(buffer);
+  const signature = new TextDecoder().decode(new Uint8Array(buffer, 0, 4));
+  if (signature !== "LASF") return null;
+
+  const stride = view.getUint16(105, true);
+  const pointFormat = view.getUint8(104) & 0x0f;
+  const offsetToData = view.getUint32(96, true);
+  if (!stride || buffer.byteLength < offsetToData + stride) return null;
+
+  let pointCount = view.getUint32(107, true);
+  const viewWith64 = view as DataView & {
+    getBigUint64?: (byteOffset: number, littleEndian?: boolean) => bigint;
+  };
+  if (
+    pointCount === 0 &&
+    typeof viewWith64.getBigUint64 === "function" &&
+    buffer.byteLength >= 255
+  ) {
+    const extended = Number(viewWith64.getBigUint64(247, true));
+    if (Number.isFinite(extended) && extended > 0) {
+      pointCount = extended;
+    }
+  }
+
+  if (pointCount <= 0) return null;
+
+  const scaleX = view.getFloat64(131, true);
+  const scaleY = view.getFloat64(139, true);
+  const scaleZ = view.getFloat64(147, true);
+  const offsetX = view.getFloat64(155, true);
+  const offsetY = view.getFloat64(163, true);
+  const offsetZ = view.getFloat64(171, true);
+
+  const availableRecords = Math.floor((buffer.byteLength - offsetToData) / stride);
+  const totalRecords = Math.min(pointCount, availableRecords);
+  if (totalRecords <= 0) return null;
+
+  const step = Math.max(1, Math.floor(totalRecords / MAX_POINTS));
+  const sampledCount = Math.max(1, Math.floor(totalRecords / step));
+  const positions = new Float32Array(sampledCount * 3);
+  const hasColor = pointFormat === 2 || pointFormat === 3;
+  const colors = hasColor ? new Float32Array(sampledCount * 3) : undefined;
+
+  const colorOffset = pointFormat === 3 ? 28 : 20;
+  const colorNorm = 1 / 65535;
+  let writeIndex = 0;
+
+  for (let i = 0; i < totalRecords; i += step) {
+    const base = offsetToData + i * stride;
+    if (base + 12 > buffer.byteLength) break;
+    const xi = view.getInt32(base, true);
+    const yi = view.getInt32(base + 4, true);
+    const zi = view.getInt32(base + 8, true);
+    const x = xi * scaleX + offsetX;
+    const y = yi * scaleY + offsetY;
+    const z = zi * scaleZ + offsetZ;
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(z) ||
+      Math.abs(x) > MAX_POINT_MAGNITUDE ||
+      Math.abs(y) > MAX_POINT_MAGNITUDE ||
+      Math.abs(z) > MAX_POINT_MAGNITUDE
+    ) {
+      continue;
+    }
+
+    positions[writeIndex * 3 + 0] = x;
+    positions[writeIndex * 3 + 1] = y;
+    positions[writeIndex * 3 + 2] = z;
+
+    if (colors && base + colorOffset + 6 <= buffer.byteLength) {
+      const red = view.getUint16(base + colorOffset, true) * colorNorm;
+      const green = view.getUint16(base + colorOffset + 2, true) * colorNorm;
+      const blue = view.getUint16(base + colorOffset + 4, true) * colorNorm;
+      colors[writeIndex * 3 + 0] = Math.min(1, red);
+      colors[writeIndex * 3 + 1] = Math.min(1, green);
+      colors[writeIndex * 3 + 2] = Math.min(1, blue);
+    }
+
+    writeIndex++;
+    if (writeIndex >= sampledCount) break;
+  }
+
+  if (writeIndex === 0) return null;
+
+  return {
+    positions: writeIndex === sampledCount ? positions : positions.slice(0, writeIndex * 3),
+    colors: colors
+      ? writeIndex === sampledCount
+        ? colors
+        : colors.slice(0, writeIndex * 3)
+      : undefined,
+    metadata: {
+      headerOffset: offsetToData,
+      declaredCount: pointCount,
+      recordCount: totalRecords,
+      downsampleStep: step,
+      probeFloatHits: 0,
+      probeIntHits: 0,
+      usedIntegerMode: false,
+      acceptedPoints: writeIndex,
+    },
+  };
+};
+
+const buildPoseGroup = (data: string | ArrayBuffer) => {
+  let records: number[][] = [];
+  if (typeof data === "string") {
+    const tokens = data
+      .trim()
+      .split(/\s+/)
+      .map((val) => parseFloat(val));
+    if (tokens.length < 13) return null;
+    const total = Math.floor(tokens.length / 13);
+    for (let i = 0; i < total; i++) {
+      records.push(tokens.slice(i * 13, i * 13 + 13));
+    }
+  } else {
+    const view = new DataView(data);
+    const strideBytes = 13 * 4;
+    if (view.byteLength < strideBytes) return null;
+    const total = Math.floor(view.byteLength / strideBytes);
+    if (!Number.isFinite(total) || total <= 0) return null;
+    for (let i = 0; i < total; i++) {
+      const base = i * strideBytes;
+      const record: number[] = [];
+      for (let j = 0; j < 13; j++) {
+        record.push(view.getFloat32(base + j * 4, true));
+      }
+      records.push(record);
+    }
+  }
+
+  if (records.length === 0) return null;
+  const step = Math.max(1, Math.floor(records.length / MAX_POSES));
+  const group = new THREE.Group();
+  for (let i = 0; i < records.length; i += step) {
+    const matrixValues = records[i].slice(1, 13);
+    const matrix = new THREE.Matrix4();
+    matrix.set(
+      matrixValues[0],
+      matrixValues[1],
+      matrixValues[2],
+      matrixValues[3],
+      matrixValues[4],
+      matrixValues[5],
+      matrixValues[6],
+      matrixValues[7],
+      matrixValues[8],
+      matrixValues[9],
+      matrixValues[10],
+      matrixValues[11],
+      0,
+      0,
+      0,
+      1
+    );
+    const axes = new THREE.AxesHelper(0.4);
+    axes.applyMatrix4(matrix);
+    group.add(axes);
+  }
+  return group;
+};
+
+const buildPoseLocations = (text: string) => {
+  const tokens = text
+    .trim()
+    .split(/\s+/)
+    .map((val) => parseFloat(val));
+  if (tokens.length < 4) return null;
+  const total = Math.floor(tokens.length / 4);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  const step = Math.max(1, Math.floor(total / MAX_POSE_LOC_POINTS));
+  const sampledCount = Math.max(1, Math.floor(total / step));
+  const positions = new Float32Array(sampledCount * 3);
+  let writeIndex = 0;
+  for (let i = 0; i < total; i += step) {
+    const base = i * 4;
+    const x = tokens[base];
+    const y = tokens[base + 1];
+    const z = tokens[base + 2];
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      return null;
+    }
+    positions[writeIndex * 3 + 0] = x;
+    positions[writeIndex * 3 + 1] = y;
+    positions[writeIndex * 3 + 2] = z;
+    writeIndex++;
+    if (writeIndex >= sampledCount) break;
+  }
+  return positions;
+};
+
 export function ModelScene({
   modelUrl,
   modelExtension,
   modelName,
   assetMap,
+  pointCloud,
+  poseData,
+  poseLocations,
   onRotateRequest,
   cameraRef,
   onControlsReady,
   onLoadingChange,
+  scaleMultiplier = 1,
 }: ModelSceneProps) {
   const { scene, camera, gl } = useThree();
   const [model, setModel] = useState<THREE.Object3D | null>(null);
@@ -103,6 +466,8 @@ export function ModelScene({
   const moveVectorRef = useRef(new THREE.Vector3());
   const yawQuaternion = useRef(new THREE.Quaternion());
   const rotationEuler = useRef(new THREE.Euler(0, 0, 0, "YXZ"));
+  const baseScaleRef = useRef(1);
+  const lastZoomVector = useRef(new THREE.Vector3());
 
   const disposeObject = (object: THREE.Object3D) => {
     object.traverse((child) => {
@@ -129,8 +494,9 @@ const alignInitialModel = (object: THREE.Object3D) => {
   const size = box.getSize(new THREE.Vector3());
   object.position.sub(center);
   const maxDim = Math.max(size.x, size.y, size.z) || 1;
-  const scale = 8 / maxDim;
+  const scale = 18 / maxDim;
   object.scale.setScalar(scale);
+  baseScaleRef.current = scale;
   const adjustedBox = new THREE.Box3().setFromObject(object);
   const adjustedCenter = adjustedBox.getCenter(new THREE.Vector3());
   object.position.x -= adjustedCenter.x;
@@ -154,6 +520,7 @@ const recenterModel = (object: THREE.Object3D) => {
     disposeObject(modelRef.current);
     modelRef.current = null;
     setModel(null);
+    baseScaleRef.current = 1;
   };
 
   const resetCamera = () => {
@@ -276,6 +643,33 @@ const recenterModel = (object: THREE.Object3D) => {
       element.removeEventListener("pointerleave", handlePointerLeave);
     };
   }, [gl]);
+
+  // Scroll zoom controls
+  useEffect(() => {
+    const element = gl.domElement;
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const delta = -event.deltaY * ZOOM_SPEED;
+      if (delta === 0) return;
+      const direction = lastZoomVector.current
+        .set(0, 0, -1)
+        .applyQuaternion(camera.quaternion)
+        .normalize();
+      const nextPosition = camera.position.clone().addScaledVector(direction, delta);
+      const distance = nextPosition.length();
+      if (distance < MIN_ZOOM_DISTANCE) {
+        nextPosition.setLength(MIN_ZOOM_DISTANCE);
+      } else if (distance > MAX_ZOOM_DISTANCE) {
+        nextPosition.setLength(MAX_ZOOM_DISTANCE);
+      }
+      camera.position.copy(nextPosition);
+    };
+
+    element.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      element.removeEventListener("wheel", handleWheel);
+    };
+  }, [camera, gl]);
 
   // Keyboard movement controls
   useEffect(() => {
@@ -440,6 +834,70 @@ const recenterModel = (object: THREE.Object3D) => {
           object = await new Promise<THREE.Object3D>((resolve, reject) => {
             loader.load(modelUrl, resolve, undefined, reject);
           });
+        } else if (modelExtension === "bin" && pointCloud?.kind === "bin") {
+          const response = await fetch(pointCloud.url);
+          const arrayBuffer = await response.arrayBuffer();
+          const parsed = parsePointCloud(arrayBuffer, pointCloud.hasHeaderCount);
+          if (!parsed) {
+            throw new Error("Unsupported point cloud binary layout.");
+          }
+          console.info("[pointcloud] Loaded", parsed.positions.length / 3, "points.", parsed.metadata);
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute("position", new THREE.BufferAttribute(parsed.positions, 3));
+          geometry.computeBoundingBox();
+          geometry.computeBoundingSphere();
+          const material = new THREE.PointsMaterial({
+            size: 0.01,
+            vertexColors: false,
+            color: new THREE.Color("#ffffff"),
+          });
+          object = new THREE.Points(geometry, material);
+        } else if (modelExtension === "las" && pointCloud?.kind === "las") {
+          const response = await fetch(pointCloud.url);
+          const arrayBuffer = await response.arrayBuffer();
+          const parsed = parseLasPointCloud(arrayBuffer);
+          if (!parsed) {
+            throw new Error("Unsupported LAS layout.");
+          }
+          console.info("[pointcloud-las] Loaded", parsed.positions.length / 3, "points.", parsed.metadata);
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute("position", new THREE.BufferAttribute(parsed.positions, 3));
+          geometry.computeBoundingBox();
+          geometry.computeBoundingSphere();
+          const material = new THREE.PointsMaterial({
+            size: 0.01,
+            vertexColors: false,
+            color: new THREE.Color("#ffffff"),
+          });
+          object = new THREE.Points(geometry, material);
+        } else if (modelExtension === "pf" && poseData) {
+          const response = await fetch(poseData.url);
+          const text = await response.text();
+          const poseGroup = buildPoseGroup(text);
+          if (!poseGroup) {
+            throw new Error("Unsupported pose file layout.");
+          }
+          console.info("[pose] Rendering", poseGroup.children.length, "poses.");
+          object = poseGroup;
+        } else if (modelExtension === "plf" && poseLocations) {
+          const response = await fetch(poseLocations.url);
+          const text = await response.text();
+          const positions = buildPoseLocations(text);
+          if (!positions) {
+            throw new Error("Unsupported pose location layout.");
+          }
+          console.info(
+            "[pose-locations] Rendering",
+            positions.length / 3,
+            "pose points."
+          );
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+          const material = new THREE.PointsMaterial({
+            size: 0.05,
+            color: new THREE.Color("#ff8800"),
+          });
+          object = new THREE.Points(geometry, material);
         }
 
         if (object) {
@@ -468,7 +926,23 @@ const recenterModel = (object: THREE.Object3D) => {
       cancelled = true;
       onLoadingChange?.(false);
     };
-  }, [modelUrl, modelExtension, assetMap, modelName, onLoadingChange]);
+  }, [
+    modelUrl,
+    modelExtension,
+    assetMap,
+    modelName,
+    pointCloud,
+    poseData,
+    poseLocations,
+    onLoadingChange,
+  ]);
+
+  useEffect(() => {
+    if (!modelRef.current) return;
+    const baseScale = baseScaleRef.current || 1;
+    modelRef.current.scale.setScalar(baseScale * scaleMultiplier);
+    recenterModel(modelRef.current);
+  }, [scaleMultiplier]);
 
   useFrame((_, delta) => {
     rotationEuler.current.set(pitchRef.current, yawRef.current, 0, "YXZ");
