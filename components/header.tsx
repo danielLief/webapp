@@ -16,6 +16,7 @@ const navLinks = [
 export const Header = () => {
   const pathname = usePathname();
   const onViewerPage = pathname?.startsWith("/viewer");
+  const showNav = !onViewerPage;
 
   return (
     <div
@@ -30,24 +31,28 @@ export const Header = () => {
         <Link href="/">
           <Logo className="w-[110px] md:w-[130px]" />
         </Link>
-        <nav className="flex max-lg:hidden absolute left-1/2 -translate-x-1/2 items-center justify-center gap-x-10">
-          {navLinks.map((item) => (
-            <Link
-              className="uppercase inline-block font-mono text-foreground/60 hover:text-foreground/100 duration-150 transition-colors ease-out"
-              href={item.href}
-              key={item.label}
-            >
-              {item.label}
-            </Link>
-          ))}
-        </nav>
-        <Link
-          className="uppercase max-lg:hidden transition-colors ease-out duration-150 font-mono text-white hover:text-white/80"
-          href="/#sign-in"
-        >
-          Sign In
-        </Link>
-        <MobileMenu />
+        {showNav && (
+          <nav className="flex max-lg:hidden absolute left-1/2 -translate-x-1/2 items-center justify-center gap-x-10">
+            {navLinks.map((item) => (
+              <Link
+                className="uppercase inline-block font-mono text-foreground/60 hover:text-foreground/100 duration-150 transition-colors ease-out"
+                href={item.href}
+                key={item.label}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+        )}
+        {showNav && (
+          <Link
+            className="uppercase max-lg:hidden transition-colors ease-out duration-150 font-mono text-white hover:text-white/80"
+            href="/#sign-in"
+          >
+            Sign In
+          </Link>
+        )}
+        {showNav && <MobileMenu />}
       </header>
     </div>
   );
