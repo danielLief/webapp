@@ -10,7 +10,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "REscan",
+  title: "REscan Web Viewer",
   description: "Walk through 3D models instantly with REscan.",
   generator: "v0.app",
 };

@@ -1,17 +1,25 @@
 import { cn } from "@/lib/utils";
+import Image from "next/image";
 
-interface LogoProps extends React.HTMLAttributes<HTMLSpanElement> {}
+interface LogoProps extends React.HTMLAttributes<HTMLDivElement> {}
 
 export const Logo = ({ className, ...props }: LogoProps) => {
   return (
-    <span
+    <div
       className={cn(
-        "font-mono tracking-[0.2em] text-base md:text-lg text-white uppercase",
+        "relative",
         className
       )}
       {...props}
     >
-      REscan
-    </span>
+      <Image
+        src="/REscan Logo White.png"
+        alt="Rescan Logo"
+        width={130}
+        height={40}
+        className="w-full h-auto"
+        priority
+      />
+    </div>
   );
 };
