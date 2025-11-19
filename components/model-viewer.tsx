@@ -16,12 +16,16 @@ type AssetMap = Record<string, string>;
 type PointCloudData =
   | {
       kind: "bin";
-      url: string;
       hasHeaderCount: boolean;
+      buffer: ArrayBuffer;
     }
   | {
       kind: "las";
-      url: string;
+      buffer: ArrayBuffer;
+    }
+  | {
+      kind: "pci";
+      file: File;
     };
 
 type PoseData = {
@@ -32,7 +36,17 @@ type PoseLocationsData = {
   url: string;
 };
 
-const SUPPORTED_MODEL_EXTENSIONS = ["glb", "gltf", "fbx", "obj", "bin", "las", "pf", "plf"];
+const SUPPORTED_MODEL_EXTENSIONS = [
+  "glb",
+  "gltf",
+  "fbx",
+  "obj",
+  "bin",
+  "las",
+  "pci",
+  "pf",
+  "plf",
+];
 
 const normalizeName = (name: string) => {
   const cleaned = name.trim().replace(/^["']|["']$/g, "").split(/[?#]/)[0];
@@ -72,7 +86,29 @@ export function ModelViewer() {
     };
   }, []);
 
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const fileToBuffer = async (file: File) => {
+    try {
+      return await file.arrayBuffer();
+    } catch (error) {
+      console.warn("[upload] file.arrayBuffer() failed, trying Response fallback.", error);
+    }
+
+    try {
+      return await new Response(file).arrayBuffer();
+    } catch (error) {
+      console.warn("[upload] Response(file).arrayBuffer() failed, trying FileReader fallback.", error);
+    }
+
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as ArrayBuffer);
+      reader.onerror = () =>
+        reject(reader.error ?? new Error("Failed to read file contents via FileReader."));
+      reader.readAsArrayBuffer(file);
+    });
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(event.target.files ?? []);
     if (selectedFiles.length === 0) {
       return;
@@ -110,17 +146,26 @@ export function ModelViewer() {
     setScale(1);
     if (primaryExt === "bin" && primaryUrl) {
       const size = primaryFile.size;
+      const buffer = await fileToBuffer(primaryFile);
       setPointCloud({
         kind: "bin",
-        url: primaryUrl,
         hasHeaderCount: size >= 4,
+        buffer,
       });
       setPoseData(null);
       setPoseLocations(null);
     } else if (primaryExt === "las" && primaryUrl) {
+      const buffer = await fileToBuffer(primaryFile);
       setPointCloud({
         kind: "las",
-        url: primaryUrl,
+        buffer,
+      });
+      setPoseData(null);
+      setPoseLocations(null);
+    } else if (primaryExt === "pci" && primaryUrl) {
+      setPointCloud({
+        kind: "pci",
+        file: primaryFile,
       });
       setPoseData(null);
       setPoseLocations(null);
@@ -233,7 +278,7 @@ export function ModelViewer() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".gltf,.glb,.obj,.fbx,.mtl,.png,.jpg,.jpeg,.webp,.bin,.las,.pf,.plf"
+              accept=".gltf,.glb,.obj,.fbx,.mtl,.png,.jpg,.jpeg,.webp,.bin,.las,.pci,.pf,.plf"
               multiple
               onChange={handleFileUpload}
               className="hidden"
@@ -261,7 +306,7 @@ export function ModelViewer() {
         {/* Info */}
         <div className="space-y-2 pt-2 border-t border-border">
           <p className="font-mono text-xs text-foreground/40 leading-relaxed">
-            Supported formats: Raw Mesh (OBJ), Textured Mesh (OBJ + MTL + PNG), Point Cloud (BIN, LAS), Pose File (PF), Pose Locations (PLF)
+            Supported formats: Raw Mesh (OBJ), Textured Mesh (OBJ + MTL + PNG), Point Cloud (BIN, LAS, PCI), Pose File (PF), Pose Locations (PLF)
           </p>
           <p className="font-mono text-xs text-foreground/40 leading-relaxed">
             Controls: WASD to move • Space to rise • Shift to descend • Hold left-click and drag to look around

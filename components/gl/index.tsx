@@ -1,7 +1,7 @@
 import { Perf } from "r3f-perf";
 import { Effects } from "@react-three/drei";
 import { Canvas } from "@react-three/fiber";
-import { useControls } from "leva";
+import { useControls, Leva } from "leva";
 import { Particles } from "./particles";
 import { VignetteShader } from "./shaders/vignetteShader";
 
@@ -78,6 +78,7 @@ export const GL = ({ hovering = false }: { hovering?: boolean }) => {
           />
         </Effects>
       </Canvas>
+      <Leva hidden />
     </div>
   );
 };

@@ -19,12 +19,16 @@ interface ModelSceneProps {
   pointCloud?:
     | {
         kind: "bin";
-        url: string;
         hasHeaderCount: boolean;
+        buffer: ArrayBuffer;
       }
     | {
         kind: "las";
-        url: string;
+        buffer: ArrayBuffer;
+      }
+    | {
+        kind: "pci";
+        file: File;
       }
     | null;
   poseData?: {
@@ -225,6 +229,86 @@ const parsePointCloud = (
       probeFloatHits: floatValid,
       probeIntHits: intValid,
       usedIntegerMode: useInt,
+      acceptedPoints: writeIndex,
+    },
+  };
+};
+
+const readFileSlice = async (file: File, start: number, length: number) => {
+  const slice = file.slice(start, start + length);
+  if (slice.size === 0) {
+    return new ArrayBuffer(0);
+  }
+  return await slice.arrayBuffer();
+};
+
+const parsePciPointCloudFromFile = async (file: File): Promise<ParsedPointCloud | null> => {
+  const stride = 24;
+  if (file.size < 4 + stride) return null;
+  const headerBuffer = await readFileSlice(file, 0, 4);
+  if (headerBuffer.byteLength < 4) return null;
+  const view = new DataView(headerBuffer);
+  const declaredCount = view.getUint32(0, true);
+  const availableRecords = Math.floor((file.size - 4) / stride);
+  if (availableRecords <= 0) return null;
+  const recordCount =
+    declaredCount > 0 && declaredCount <= availableRecords ? declaredCount : availableRecords;
+  if (recordCount <= 0) return null;
+
+  const step = Math.max(1, Math.floor(recordCount / MAX_POINTS));
+  const sampledCount = Math.max(1, Math.floor(recordCount / step));
+  const positions = new Float32Array(sampledCount * 3);
+
+  const maxChunkBytes = 4 * 1024 * 1024;
+  const recordsPerChunk = Math.max(1, Math.floor(maxChunkBytes / stride));
+
+  let writeIndex = 0;
+  let recordOffset = 0;
+  while (recordOffset < recordCount && writeIndex < sampledCount) {
+    const recordsToRead = Math.min(recordsPerChunk, recordCount - recordOffset);
+    const chunkStart = 4 + recordOffset * stride;
+    const chunkLength = recordsToRead * stride;
+    const chunkBuffer = await readFileSlice(file, chunkStart, chunkLength);
+    const chunkView = new DataView(chunkBuffer);
+
+    for (let i = 0; i < recordsToRead; i++) {
+      const globalIndex = recordOffset + i;
+      if (globalIndex % step !== 0) continue;
+      const base = i * stride;
+      const x = chunkView.getFloat32(base, true);
+      const y = chunkView.getFloat32(base + 4, true);
+      const z = chunkView.getFloat32(base + 8, true);
+      if (
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        !Number.isFinite(z) ||
+        Math.abs(x) > MAX_POINT_MAGNITUDE ||
+        Math.abs(y) > MAX_POINT_MAGNITUDE ||
+        Math.abs(z) > MAX_POINT_MAGNITUDE
+      ) {
+        continue;
+      }
+      positions[writeIndex * 3 + 0] = x;
+      positions[writeIndex * 3 + 1] = y;
+      positions[writeIndex * 3 + 2] = z;
+      writeIndex++;
+      if (writeIndex >= sampledCount) break;
+    }
+
+    recordOffset += recordsToRead;
+  }
+
+  if (writeIndex === 0) return null;
+  return {
+    positions: writeIndex === sampledCount ? positions : positions.slice(0, writeIndex * 3),
+    metadata: {
+      headerOffset: 4,
+      declaredCount,
+      recordCount,
+      downsampleStep: step,
+      probeFloatHits: recordCount,
+      probeIntHits: 0,
+      usedIntegerMode: true,
       acceptedPoints: writeIndex,
     },
   };
@@ -835,9 +919,7 @@ const recenterModel = (object: THREE.Object3D) => {
             loader.load(modelUrl, resolve, undefined, reject);
           });
         } else if (modelExtension === "bin" && pointCloud?.kind === "bin") {
-          const response = await fetch(pointCloud.url);
-          const arrayBuffer = await response.arrayBuffer();
-          const parsed = parsePointCloud(arrayBuffer, pointCloud.hasHeaderCount);
+          const parsed = parsePointCloud(pointCloud.buffer, pointCloud.hasHeaderCount);
           if (!parsed) {
             throw new Error("Unsupported point cloud binary layout.");
           }
@@ -853,13 +935,32 @@ const recenterModel = (object: THREE.Object3D) => {
           });
           object = new THREE.Points(geometry, material);
         } else if (modelExtension === "las" && pointCloud?.kind === "las") {
-          const response = await fetch(pointCloud.url);
-          const arrayBuffer = await response.arrayBuffer();
-          const parsed = parseLasPointCloud(arrayBuffer);
+          const parsed = parseLasPointCloud(pointCloud.buffer);
           if (!parsed) {
             throw new Error("Unsupported LAS layout.");
           }
           console.info("[pointcloud-las] Loaded", parsed.positions.length / 3, "points.", parsed.metadata);
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute("position", new THREE.BufferAttribute(parsed.positions, 3));
+          geometry.computeBoundingBox();
+          geometry.computeBoundingSphere();
+          const material = new THREE.PointsMaterial({
+            size: 0.01,
+            vertexColors: false,
+            color: new THREE.Color("#ffffff"),
+          });
+          object = new THREE.Points(geometry, material);
+        } else if (modelExtension === "pci" && pointCloud?.kind === "pci" && pointCloud.file) {
+          const parsed = await parsePciPointCloudFromFile(pointCloud.file);
+          if (!parsed) {
+            throw new Error("Unsupported PCI layout.");
+          }
+          console.info(
+            "[pointcloud-pci] Loaded",
+            parsed.positions.length / 3,
+            "points.",
+            parsed.metadata
+          );
           const geometry = new THREE.BufferGeometry();
           geometry.setAttribute("position", new THREE.BufferAttribute(parsed.positions, 3));
           geometry.computeBoundingBox();

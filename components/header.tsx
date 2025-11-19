@@ -47,7 +47,7 @@ export const Header = () => {
         {showNav && (
           <Link
             className="uppercase max-lg:hidden transition-colors ease-out duration-150 font-mono text-white hover:text-white/80"
-            href="/#sign-in"
+            href="/signin"
           >
             Sign In
           </Link>
